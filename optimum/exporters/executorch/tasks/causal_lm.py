@@ -51,7 +51,10 @@ def load_causal_lm_model(model_name_or_path: str, **kwargs) -> CausalLMExportabl
             An instance of `CausalLMExportableModule` for exporting and lowering to ExecuTorch.
     """
     device = kwargs.get("device", "cpu")
-    batch_size = 1
+    # Static batch size for the exported forward + KV cache. >1 enables lock-step batched decode
+    # (e.g. N independent sequences, or beam search where the caller reorders the shared cache
+    # buffers in a separate graph). All rows must stay at the same cache position each step.
+    batch_size = kwargs.get("batch_size", 1)
     dtype = kwargs.get("dtype", "float32")
     disable_dynamic_shapes = kwargs.get("disable_dynamic_shapes", False)
     use_custom_sdpa = kwargs.get("use_custom_sdpa", False)
@@ -155,5 +158,5 @@ def load_causal_lm_model(model_name_or_path: str, **kwargs) -> CausalLMExportabl
     )
 
     return CausalLMExportableModule(
-        eager_model, max_length, use_custom_kv_cache, use_custom_sdpa, disable_dynamic_shapes
+        eager_model, max_length, use_custom_kv_cache, use_custom_sdpa, disable_dynamic_shapes, batch_size=batch_size
     )

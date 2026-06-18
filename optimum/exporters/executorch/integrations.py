@@ -414,6 +414,7 @@ class CausalLMExportableModule(torch.nn.Module):
         use_custom_kv_cache=False,
         use_custom_sdpa=False,
         disable_dynamic_shapes=False,
+        batch_size=1,
     ):
         super().__init__()
         self.model = model
@@ -421,6 +422,11 @@ class CausalLMExportableModule(torch.nn.Module):
         self.use_custom_kv_cache = use_custom_kv_cache
         self.use_custom_sdpa = use_custom_sdpa
         self.disable_dynamic_shapes = disable_dynamic_shapes
+        # Static batch dim for the exported forward. Must match the KV cache's
+        # max_batch_size (generation_config.cache_config["batch_size"]) so the per-row cache
+        # slices line up. Lock-step decode only: cache_position / cumulative_length are shared
+        # across rows, so every row sits at the same position each step.
+        self.batch_size = batch_size
         self.metadata = save_config_to_constant_methods(
             model.config,
             generation_config=getattr(model, "generation_config", None),
@@ -440,7 +446,7 @@ class CausalLMExportableModule(torch.nn.Module):
             strict (bool): Whether to use strict export mode.
         """
         # Default values for legacy or fallback cases
-        example_input_ids = torch.tensor([[1]], dtype=torch.long, device=self.model.device)
+        example_input_ids = torch.ones((self.batch_size, 1), dtype=torch.long, device=self.model.device)
         example_cache_position = torch.tensor([0], dtype=torch.long, device=self.model.device)
         dynamic_shapes = None
         strict = True
@@ -460,7 +466,7 @@ class CausalLMExportableModule(torch.nn.Module):
         ):
             # Prepare inputs with dynamic shapes
             seq_length = 3  # Sequence length > 1 to avoid specialization issue
-            example_input_ids = torch.zeros((1, seq_length), dtype=torch.long, device=self.model.device)
+            example_input_ids = torch.zeros((self.batch_size, seq_length), dtype=torch.long, device=self.model.device)
             example_cache_position = torch.arange(seq_length, dtype=torch.long, device=self.model.device)
             max_seq_len = self.metadata.get("get_max_seq_len")
             sliding_window = getattr(self.config, "sliding_window", None)

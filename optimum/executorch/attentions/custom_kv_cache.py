@@ -144,12 +144,26 @@ class ETCustomStaticCache(StaticCache):
         return k_out, v_out
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
-        # Occupied cache == any slot in the 2nd dim (sequence length) holds a non-zero value
-        # This is different from StaticCache which checks the 3rd dim
+        """Return the current cache position (where this forward's first query token sits).
+
+        Transformers v5 derives the query's ``cache_position``/``position_ids`` from this value
+        whenever the caller does not pass ``cache_position`` explicitly -- which the ExecuTorch
+        export wrapper (``TorchExportableModuleWithStaticCache.forward``) does not. Instead the
+        wrapper seeds each ``StaticLayer.cumulative_length`` from the incoming ``cache_position[0]``
+        before every forward, so we must report that (the base ``StaticLayer`` contract), and NOT a
+        count of populated KV slots.
+
+        A populated-slot count (``k_cache[..].any().sum()``) is persistent buffer state that only
+        ever grows and is never reset between top-level forwards. Returning it overrides the seeded
+        position, so the custom_sdpa causal/read window (``start_pos = position_ids[0][0]``) attends
+        to stale slots on any rewound or repeated forward -- e.g. a second ``generate()`` call reads
+        the previous call's K/V and produces garbage. The write position is unaffected (it follows
+        ``cumulative_length`` directly), so writes and reads disagree, which is the actual defect.
+        See ``transformers.cache_utils.StaticCache.get_seq_length``.
+        """
         if layer_idx is None:
             layer_idx = 0
-        return (self.kv_cache[layer_idx].k_cache[0, :, 0].any(dim=-1)).sum()
+        return self.layers[layer_idx].get_seq_length()
 
     @classmethod
     def from_legacy_cache(

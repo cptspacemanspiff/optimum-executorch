@@ -691,6 +691,12 @@ class ExecuTorchModelForCausalLM(ExecuTorchModelBase):
         """
         self.stats.on_model_execution_start()
 
+        logging.info(
+            "[forward] input_ids=%s cache_position=%s",
+            input_ids.tolist(),
+            cache_position.tolist(),
+        )
+
         try:
             logits = self.model.forward((input_ids, cache_position))[0]
         except Exception as e:
