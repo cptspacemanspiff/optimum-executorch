@@ -11,7 +11,11 @@ import torch
 
 # If transformers is not installed, raise an ImportError
 try:
-    from transformers.cache_utils import HybridCache, StaticCache
+    # NOTE: As of transformers v5 (PR #43168), the standalone HybridCache class was removed.
+    # StaticCache now inspects the model config's `layer_types` and builds the appropriate
+    # per-layer cache (full-attention vs. sliding-window/chunked) itself, so it is the
+    # replacement for both the old StaticCache and HybridCache.
+    from transformers.cache_utils import StaticCache
 except ImportError:
     raise ImportError("transformers is not installed. Please install it to use Static/HybridCache.")
 
@@ -22,6 +26,23 @@ try:
     )
 except ImportError:
     raise ImportError("ExecutorTorch is not installed. Please install it to use Custom Cache.")
+
+
+def _resolve_cache_position(cache, layer_idx, key_states, cache_kwargs):
+    """Resolve the per-token cache positions for a custom KV cache update.
+
+    In transformers < v5, the model passed `cache_position` through `cache_kwargs`. Since the v5
+    cache refactor, the model calls `update(key_states, value_states, layer_idx)` with no
+    `cache_kwargs`; instead each cache layer derives its positions from its own `cumulative_length`,
+    which the ExecuTorch export wrapper (`TorchExportableModuleWith{Static,Hybrid}Cache`) seeds with
+    the start position before every forward. We reproduce the same `arange(q_len) + start` tensor here
+    so the underlying ExecuTorch CustomKVCache/CustomRingKVCache still receives an `input_pos`.
+    """
+    if cache_kwargs is not None and cache_kwargs.get("cache_position") is not None:
+        return cache_kwargs["cache_position"]
+    # transformers v5 path: positions come from the HF layer's cumulative_length.
+    layer = cache.layers[layer_idx]
+    return torch.arange(key_states.shape[-2], device=key_states.device) + layer.cumulative_length
 
 
 class ETCustomStaticCache(StaticCache):
@@ -50,6 +71,7 @@ class ETCustomStaticCache(StaticCache):
         self.early_initialization(
             batch_size=max_batch_size, num_heads=num_heads, head_dim=head_dim, dtype=dtype, device=device
         )
+        # NOTE: head_dim was split into k_head_dim/v_head_dim on the cache layers in transformers v5.
 
         # Validate device - handle both string and torch.device types
         if device is not None:
@@ -72,7 +94,7 @@ class ETCustomStaticCache(StaticCache):
                 max_batch_size=layer.max_batch_size,
                 max_context_length=layer.max_cache_len,
                 n_heads=layer.num_heads,
-                head_dim=layer.head_dim,
+                head_dim=layer.k_head_dim,
                 dtype=dtype,
             )
             layer_cache.k_cache = layer_cache.k_cache.to(device)
@@ -103,10 +125,9 @@ class ETCustomStaticCache(StaticCache):
         Returns:
             A tuple containing the updated key and value states.
         """
-        assert cache_kwargs is not None
-
-        # Get cache position from cache_kwargs (used by StaticCache)
-        cache_position = cache_kwargs.get("cache_position")
+        # In transformers v5 the model no longer threads `cache_position` via `cache_kwargs`;
+        # derive it from the layer's cumulative_length (seeded by the export wrapper) instead.
+        cache_position = _resolve_cache_position(self, layer_idx, key_states, cache_kwargs)
         torch._assert(cache_position is not None, "cache_position must be provided")
 
         # Get the CustomKVCache instance for this layer
@@ -191,10 +212,11 @@ class ETCustomStaticCache(StaticCache):
         )
 
 
-# Need to figure out if I have to inherit from HybridCache or StaticCache
-class ETCustomHybridCache(HybridCache):
+# In transformers v5, HybridCache was folded into StaticCache (which now builds a mix of
+# full-attention and sliding-window layers based on the model config), so we inherit from it.
+class ETCustomHybridCache(StaticCache):
     """
-    Custom Hybrid KV Cache implementation for ExecutorTorch that inherits from Hugging Face's HybridCache
+    Custom Hybrid KV Cache implementation for ExecutorTorch that inherits from Hugging Face's StaticCache
     but uses ExecutorTorch's CustomKVCache for global layers and CustomRingKVCache for sliding window layers.
     """
 
@@ -244,7 +266,7 @@ class ETCustomHybridCache(HybridCache):
                     max_batch_size=layer.max_batch_size,
                     max_context_length=layer.max_cache_len,
                     n_heads=layer.num_heads,
-                    head_dim=layer.head_dim,
+                    head_dim=layer.k_head_dim,
                     dtype=dtype,
                 )
             else:
@@ -252,7 +274,7 @@ class ETCustomHybridCache(HybridCache):
                     max_batch_size=layer.max_batch_size,
                     max_context_length=layer.max_cache_len,
                     n_heads=layer.num_heads,
-                    head_dim=layer.head_dim,
+                    head_dim=layer.k_head_dim,
                     dtype=dtype,
                 )
                 layer_cache.k_cache = layer_cache.k_cache.to(device)
@@ -283,11 +305,9 @@ class ETCustomHybridCache(HybridCache):
         Returns:
             A tuple containing the updated key and value states.
         """
-        assert cache_kwargs is not None
-
-        # Get cache position from cache_kwargs (used by HybridCache)
-        cache_position = cache_kwargs.get("cache_position")
-        assert cache_position is not None
+        # In transformers v5 the model no longer threads `cache_position` via `cache_kwargs`;
+        # derive it from the layer's cumulative_length (seeded by the export wrapper) instead.
+        cache_position = _resolve_cache_position(self, layer_idx, key_states, cache_kwargs)
         assert isinstance(cache_position, torch.Tensor)
         self.cache_position = cache_position
 
@@ -388,6 +408,13 @@ def _replace_with_et_custom_kv_cache(module, config, generation_config, cache_dt
             for i in range(len(module.static_cache.kv_cache)):
                 setattr(module, f"key_cache_{i}", module.static_cache.kv_cache[i].k_cache)
                 setattr(module, f"value_cache_{i}", module.static_cache.kv_cache[i].v_cache)
+            # The export wrapper registered `cumulative_length_{i}` buffers pointing at the
+            # *original* StaticCache layers and mutates them in-place during forward (and we read
+            # them in `update` to derive cache positions). Now that we've swapped in a new cache,
+            # re-register those buffers against the new layers' tensors, otherwise they are seen as
+            # mutated constants and `run_decompositions` rejects the program.
+            for i, layer in enumerate(module.static_cache.layers):
+                module.register_buffer(f"cumulative_length_{i}", layer.cumulative_length, persistent=False)
 
     # Check if module has cache (TorchExportableModuleWithHybridCache)
     elif hasattr(module, "cache"):
@@ -413,6 +440,11 @@ def _replace_with_et_custom_kv_cache(module, config, generation_config, cache_dt
             for i in range(len(module.cache.kv_cache)):
                 setattr(module, f"key_cache_{i}", module.cache.kv_cache[i].k_cache)
                 setattr(module, f"value_cache_{i}", module.cache.kv_cache[i].v_cache)
+                # Re-register the cumulative_length buffers against the new cache's layers (see the
+                # static_cache branch above for the rationale) so their in-place mutation stays legal.
+                module.register_buffer(
+                    f"cumulative_length_{i}", module.cache.layers[i].cumulative_length, persistent=False
+                )
                 if module.cache.layers[i].is_sliding:
                     # Register cache_positions as buffer for sliding window layers
                     # This prevents it from being traced as a constant

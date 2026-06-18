@@ -48,6 +48,7 @@ def load_seq2seq_lm_model(model_name_or_path: str, **kwargs) -> Seq2SeqLMExporta
     batch_size = 1
     max_hidden_seq_len = kwargs.get("max_hidden_seq_len", 4096)
     max_seq_len = kwargs.get("max_seq_len", 1024)
+    use_cross_attention_cache = kwargs.get("use_cross_attention_cache", False)
 
     full_model = AutoModelForSeq2SeqLM.from_pretrained(model_name_or_path).to(device).eval()
     return Seq2SeqLMExportableModule(
@@ -55,4 +56,5 @@ def load_seq2seq_lm_model(model_name_or_path: str, **kwargs) -> Seq2SeqLMExporta
         batch_size=batch_size,
         max_seq_len=max_seq_len,
         max_hidden_seq_len=max_hidden_seq_len,
+        use_cross_attention_cache=use_cross_attention_cache,
     )

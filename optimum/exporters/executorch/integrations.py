@@ -22,6 +22,7 @@ from torch.nn.attention import SDPBackend
 from transformers import (
     AutoConfig,
     AutoProcessor,
+    DynamicCache,
     EncoderDecoderCache,
     PreTrainedModel,
     StaticCache,
@@ -35,6 +36,7 @@ from transformers.masking_utils import AttentionMaskInterface
 from transformers.modeling_utils import AttentionInterface
 
 from optimum.executorch.attentions.custom_sdpa import get_custom_sdpa_for_ring_kv_cache, sdpa_mask_passthrough
+from optimum.executorch.attentions.t5_attention import T5CrossAttention
 from optimum.executorch.attentions.whisper_attention import WhisperCrossAttention
 
 from .utils import apply_chat_template_with_fallback, save_config_to_constant_methods
@@ -746,8 +748,12 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
     is compatible with ExecuTorch.
     """
 
-    def __init__(self, model, max_static_cache_length, batch_size):
+    def __init__(self, model, max_static_cache_length, batch_size, use_cross_attention_cache=False, cross_cache_len=None):
         super().__init__()
+
+        # Whether to reuse cross-attention K/V across decode steps via a static, encoder-filled
+        # cache (compute once) instead of recomputing them every step. Only wired up for T5.
+        self._t5_cross_cache = use_cross_attention_cache and isinstance(model, T5ForConditionalGeneration)
 
         # Get the decoder component
         self.decoder = model.get_decoder()
@@ -769,31 +775,24 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
         num_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.self_attention_cache.early_initialization(batch_size, num_heads, head_dim, model.dtype, model.device)
 
-        # Initialize cross attention cache
-        cross_attention_heads = getattr(
-            self.config, "decoder_attention_heads", getattr(self.config, "num_attention_heads", None)
-        )
-        if cross_attention_heads is None:
-            raise ValueError("Unable to determine decoder attention heads for cross-attention cache.")
-        hidden_size = getattr(self.config, "hidden_size", getattr(self.config, "d_model", None))
-        if hidden_size is None:
-            raise ValueError("Unable to determine hidden size for cross-attention cache allocation.")
-        cross_head_dim = getattr(self.config, "head_dim", hidden_size // cross_attention_heads)
+        # Initialize cross attention cache.
+        #
+        # Two modes:
+        #  * Default (DynamicCache): cross-attention K/V depend only on the (constant) encoder hidden
+        #    states, which are passed into the decoder every step, so the exported single-step graph
+        #    recomputes them each step. A DynamicCache returns true-length (encoder_len) K/V that match
+        #    the cross mask; it needs no persistent buffers because nothing is reused across steps. (A
+        #    plain StaticCache would pad the cross keys to max_cache_len and return the full padded
+        #    buffer, making cross scores key_length-wide while transformers builds the cross mask at the
+        #    true encoder length -> broadcast failure during export.)
+        #  * use_cross_attention_cache (T5 only): reuse cross K/V across steps. The reuse is owned by
+        #    T5CrossAttention (it holds its own static cross-KV buffers + a torch.cond compute-once-
+        #    then-reuse branch, sized to `cross_cache_len` = the max source length), so the cross slot
+        #    of the EncoderDecoderCache is an unused DynamicCache placeholder here too.
+        self.cross_attention_cache = DynamicCache(config=self.config)
 
-        self.cross_attention_cache = StaticCache(
-            config=self.config,
-            max_batch_size=batch_size,
-            max_cache_len=getattr(
-                self.config, "max_source_positions", max_static_cache_length
-            ),  # This is fixed in whisper
-            device=model.device,
-            dtype=model.dtype,
-        )
-        self.cross_attention_cache.early_initialization(
-            batch_size, cross_attention_heads, cross_head_dim, model.dtype, model.device
-        )
-
-        # Register cache buffers to make them exportable.
+        # Register self-attention cache buffers to make them exportable. The cross-attention cache is
+        # a DynamicCache placeholder; for the reuse path the real cross buffers live on T5CrossAttention.
         for i in range(len(self.self_attention_cache)):
             self.register_buffer(
                 f"self_attention_key_cache_{i}", self.self_attention_cache.layers[i].keys, persistent=False
@@ -801,22 +800,30 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
             self.register_buffer(
                 f"self_attention_value_cache_{i}", self.self_attention_cache.layers[i].values, persistent=False
             )
-        for i in range(len(self.cross_attention_cache)):
+            # transformers v5 StaticLayer tracks a `cumulative_length` tensor that update() mutates
+            # in-place; export rejects mutated constants, so register it as a (non-persistent) buffer.
             self.register_buffer(
-                f"cross_attention_key_cache_{i}", self.cross_attention_cache.layers[i].keys, persistent=False
+                f"self_attention_cumulative_length_{i}",
+                self.self_attention_cache.layers[i].cumulative_length,
+                persistent=False,
             )
-            self.register_buffer(
-                f"cross_attention_value_cache_{i}", self.cross_attention_cache.layers[i].values, persistent=False
-            )
-        # self.register_buffer(
-        #     "cross_attention_cache_initialized", torch.zeros(batch_size, 1, dtype=torch.bool), persistent=False
-        # )
-        # Add a flag to indicate if the cache has been initialized.
-        # Initialize it as False on CPU so it can be used as a predicate in torch.cond.
-        # After the first forward pass, we'll set it to True to indicate the cache is populated.
-        # self.cross_attention_cache._initialized = self.cross_attention_cache_initialized
 
         self.cache = EncoderDecoderCache(self.self_attention_cache, self.cross_attention_cache)
+
+        # Swap T5 decoder cross-attention for the export-friendly, cache-reusing T5CrossAttention.
+        if self._t5_cross_cache:
+            # Size the cross buffers one slot beyond the max source length: the dynamic-length slice
+            # write `cross_k[:, :, :S, :]` hits a full-buffer boundary special-case (and a spurious
+            # `S != cache_len` guard) when S can equal the buffer length, so keep S strictly smaller.
+            cross_len = (cross_cache_len or max_static_cache_length) + 1
+            for i, block in enumerate(self.decoder.block):
+                block.layer[1].EncDecAttention = T5CrossAttention(
+                    block.layer[1].EncDecAttention,
+                    layer_idx=i,
+                    cross_cache_len=cross_len,
+                    dtype=model.dtype,
+                    device=model.device,
+                )
         # Use custom cross attention for Whisper.
         # Only use WhisperCrossAttention if torch.ops.executorch.alias is available and device is CUDA.
         _has_et_alias = hasattr(torch.ops, "executorch") and hasattr(torch.ops.executorch, "alias")
@@ -838,6 +845,12 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
                 layer.encoder_attn = cross_attn
 
     def forward(self, decoder_input_ids, encoder_hidden_states, cache_position):
+        # transformers does not thread cache_position into the cross-attention layer, so hand it to
+        # the T5CrossAttention modules directly; they use cache_position[0] == 0 as the "first decode
+        # step" predicate to decide whether to recompute or reuse the cross-KV cache.
+        if self._t5_cross_cache:
+            for block in self.decoder.block:
+                block.layer[1].EncDecAttention.cache_position = cache_position
         # Get outputs from decoder
         outputs = self.decoder(
             input_ids=decoder_input_ids,
@@ -871,6 +884,7 @@ class Seq2SeqLMExportableModule(torch.nn.Module):
         batch_size=1,
         max_seq_len=1024,
         max_hidden_seq_len=4096,
+        use_cross_attention_cache=False,
     ):
         super().__init__()
 
@@ -880,6 +894,10 @@ class Seq2SeqLMExportableModule(torch.nn.Module):
         self.max_hidden_seq_len = max_hidden_seq_len
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
+        # Reuse cross-attention K/V across decode steps (T5 only); see
+        # Seq2SeqLMDecoderExportableModuleWithStaticCache. The cross cache is sized to the max
+        # encoder/source length (`max_hidden_seq_len`).
+        self.use_cross_attention_cache = use_cross_attention_cache
         if isinstance(self.model, WhisperForConditionalGeneration):
             self._processor = AutoProcessor.from_pretrained(model.config._name_or_path)
             self._expected_encoder_input_shape = torch.Size(
@@ -928,6 +946,8 @@ class Seq2SeqLMExportableModule(torch.nn.Module):
                 model=self.model,
                 max_static_cache_length=self.max_seq_len,
                 batch_size=self.batch_size,
+                use_cross_attention_cache=self.use_cross_attention_cache,
+                cross_cache_len=self.max_hidden_seq_len,
             )
             .to(self.model.device)
             .eval()

@@ -20,14 +20,17 @@ from executorch.extension.llm.custom_ops.custom_ops import custom_sdpa  # noqa
 
 def sdpa_mask_passthrough(
     batch_size: int,
-    cache_position: torch.Tensor,
+    q_length: int,
     kv_length: int,
+    q_offset: int = 0,
     kv_offset: int = 0,
     mask_function: Optional[Callable] = None,
     attention_mask: Optional[torch.Tensor] = None,
     local_size: Optional[int] = None,
     allow_is_causal_skip: bool = True,
     allow_torch_fix: bool = True,
+    use_vmap: bool = False,
+    device: Union[torch.device, str] = "cpu",
     **kwargs,
 ) -> Optional[torch.Tensor]:
     """
@@ -37,13 +40,20 @@ def sdpa_mask_passthrough(
 
     Additionally, there were some vmap export issues with sliding window attention mask creation in Transformers.
 
+    NOTE: The signature mirrors transformers v5's `sdpa_mask` mask interface (transformers.masking_utils.sdpa_mask),
+    which the masking API calls purely by keyword. In v5 the old `cache_position` argument was replaced by the
+    `q_length`/`q_offset` pair, and `use_vmap`/`device` were added; keep this aligned to avoid argument-binding
+    failures during export.
+
     Args:
         batch_size (`int`):
             The batch size of the input sequence.
-        cache_position (`torch.Tensor`):
-            A tensor of shape (query_length,) indicating the current indices of the input sequence elements.
+        q_length (`int`):
+            The size that the query states will have during the attention computation.
         kv_length (`int`):
             The size that the key and value states will have during the attention computation.
+        q_offset (`int`, optional):
+            An optional offset to indicate at which first position the query states will refer to.
         kv_offset (`int`, optional):
             An optional offset to indicate at which first position the key and values states will refer to.
         mask_function (`Callable`):
@@ -59,6 +69,10 @@ def sdpa_mask_passthrough(
         allow_torch_fix (`bool`, optional):
             Whether to update the mask in case a query is not attending to any tokens, to solve a bug in torch's older
             versions. We need an arg to skip it when using eager. By default `True`.
+        use_vmap (`bool`, optional):
+            Whether the mask interface should use vmap to build the mask. Unused here. By default `False`.
+        device (`torch.device` or `str`, optional):
+            The device the mask would be created on. Unused here. By default `"cpu"`.
 
     """
     return None
